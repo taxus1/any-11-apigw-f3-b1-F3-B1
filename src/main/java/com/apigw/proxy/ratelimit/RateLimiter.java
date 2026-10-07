@@ -38,6 +38,8 @@ public class RateLimiter {
     private final RateLimitCatalog catalog;
     private final RateLimitWindowStore store;
     private final RateLimitProperties properties;
+    /** 计数存储抖动时的本机兜底：这一段按本机窗口把额度挡住。 */
+    private final LocalRateLimitWindowStore localFallback;
 
     /** 连续失败计数；达到阈值熔断打开。 */
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
@@ -54,9 +56,16 @@ public class RateLimiter {
 
     public RateLimiter(RateLimitCatalog catalog, RateLimitWindowStore store,
                        RateLimitProperties properties) {
+        this(catalog, store, properties,
+                new LocalRateLimitWindowStore(properties.windowSeconds()));
+    }
+
+    public RateLimiter(RateLimitCatalog catalog, RateLimitWindowStore store,
+                       RateLimitProperties properties, LocalRateLimitWindowStore localFallback) {
         this.catalog = catalog;
         this.store = store;
         this.properties = properties;
+        this.localFallback = localFallback;
     }
 
     public Mono<Gate> check(String appNo, String canonicalIp) {
@@ -67,7 +76,7 @@ public class RateLimiter {
 
         if (circuitOpen()) {
             // 熔断打开：不发 Redis，立即按策略决策（关键：不等待）
-            return Mono.just(onUnavailable("circuit-open"));
+            return Mono.just(onUnavailable("circuit-open", appNo, canonicalIp, quota));
         }
 
         return store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute())
@@ -76,11 +85,12 @@ public class RateLimiter {
                     consecutiveFailures.set(0);
                     return new Gate(verdict.allowed(), false, verdict);
                 })
-                .onErrorResume(err -> Mono.just(onFailure(err)));
+                .onErrorResume(err -> Mono.just(onFailure(err, appNo, canonicalIp, quota)));
     }
 
     /** 一次真实调用失败（超时/连不上/脚本错）：累计失败、必要时熔断，再按策略决策。 */
-    private Gate onFailure(Throwable err) {
+    private Gate onFailure(Throwable err, String appNo, String canonicalIp,
+                           RateLimitCatalog.EffectiveQuota quota) {
         int n = consecutiveFailures.incrementAndGet();
         if (n >= properties.circuitBreakerThreshold() && openedAtMs.compareAndSet(0, System.currentTimeMillis())) {
             log.warn("限流计数存储连续 {} 次失败（{}），熔断打开 {}ms，期间按 {} 处理",
@@ -89,13 +99,20 @@ public class RateLimiter {
         } else {
             log.debug("限流计数存储失败（第 {} 次，{}）", n, err.toString());
         }
-        return onUnavailable(err.toString());
+        return onUnavailable(err.toString(), appNo, canonicalIp, quota);
     }
 
-    private Gate onUnavailable(String reason) {
-        boolean open = properties.failOpenOnError();
-        return new Gate(open, true, open ? RateLimitVerdict.pass()
-                : RateLimitVerdict.reject("STORE", 0));
+    private Gate onUnavailable(String reason, String appNo, String canonicalIp,
+                               RateLimitCatalog.EffectiveQuota quota) {
+        if (!properties.failOpenOnError()) {
+            return new Gate(false, true, RateLimitVerdict.reject("STORE", 0));
+        }
+        // 存储抖动的这一小会儿不裸放行：交本机窗口兜底，抖动期间额度也挡在本机
+        RateLimitVerdict local = localFallback.consume(appNo, canonicalIp,
+                quota.appPerMinute(), quota.ipPerMinute());
+        log.debug("计数存储不可用（{}），本机窗口兜底：allowed={} scope={} app={} ip={}",
+                reason, local.allowed(), local.blockedScope(), appNo, canonicalIp);
+        return new Gate(local.allowed(), true, local);
     }
 
     /** 熔断是否处于打开态；到点不在这里急着清，靠下一笔真实调用充当半开探活。 */
