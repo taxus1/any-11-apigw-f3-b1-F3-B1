@@ -33,6 +33,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * - 拒绝不占名额（被 IP 层挡住的请求不消耗应用总量）；
  * - 窗口到点从零重新计数，不带余数；
  * - 多线程并发在同一窗口抢名额：全局计数下「放行数恰等于额度」，不超发也不少放；
+ * - 三台相互独立的网关（三个 store 实例）共享一份 Redis：合计放行恰等于额度，
+ *   额度不被机器数放大三倍；
  * - 计数键带 TTL，窗口结束后自动过期被回收（存储不无限膨胀）。
  */
 @EnabledIfRedis
@@ -162,6 +164,38 @@ class RedisRateLimitWindowStoreIT {
         assertThat(keyNames).hasSize(1);
         Long finalCount = redis.opsForValue().get(keyNames.get(0)).map(Long::parseLong).block();
         assertThat(finalCount).isEqualTo(limit);
+    }
+
+    @Test
+    void threeIndependentGateways_shareOneQuota_notMultiplied() {
+        // 复现并固化「额度归属只有一份」：三个相互独立的计数存储实例，模拟三台网关进程
+        // （各自 new 一个 store，互不共享任何进程内状态），背后是同一份 Redis。
+        // 额度 100 必须是三台合计 100，而不是每台各 100、放进来 300。
+        RedisRateLimitWindowStore gatewayA = new RedisRateLimitWindowStore(redis, 60);
+        RedisRateLimitWindowStore gatewayB = new RedisRateLimitWindowStore(redis, 60);
+        RedisRateLimitWindowStore gatewayC = new RedisRateLimitWindowStore(redis, 60);
+        RedisRateLimitWindowStore[] gateways = {gatewayA, gatewayB, gatewayC};
+
+        int perGatewayCalls = 120; // 三台共冲 360 次抢 100
+        AtomicInteger allowed = new AtomicInteger();
+        for (int g = 0; g < gateways.length; g++) {
+            RedisRateLimitWindowStore store = gateways[g];
+            for (int i = 0; i < perGatewayCalls; i++) {
+                RateLimitVerdict v = store.checkAndConsume(app, "10.1." + g + "." + i, 100, null)
+                        .block(Duration.ofSeconds(3));
+                if (v.allowed()) {
+                    allowed.incrementAndGet();
+                }
+            }
+        }
+
+        // 硬不变量：三台合计放行恰好 100（不是 ~300），后 260 笔全部被应用总量挡住
+        assertThat(allowed.get()).isEqualTo(100);
+
+        var keyNames = redis.keys("apigw:rl:{" + app + "}:app:*").collectList().block();
+        assertThat(keyNames).hasSize(1);
+        Long finalCount = redis.opsForValue().get(keyNames.get(0)).map(Long::parseLong).block();
+        assertThat(finalCount).isEqualTo(100);
     }
 
     @Test

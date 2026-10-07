@@ -208,6 +208,25 @@ class RateLimitWebFilterTest {
         assertThat(upstreamHits.get()).isZero();
     }
 
+    @Test
+    void storeUnavailable_failOpen_passesAllBurstToUpstream_noLocalQuota() {
+        // 故障 + fail-open：存储挂掉期间哪怕请求远超额度，也一律放行到上游，
+        // 绝不在某台本机上冒出一个「第 N+1 笔 429」的本机额度。
+        loadQuota(RateQuota.reconstitute(RateLimitScope.APP, "app-1", null, 5, null, null, null));
+        store.fail = true;
+        RateLimitProperties failOpen = new RateLimitProperties(true, Duration.ofSeconds(10), 10_000,
+                Duration.ofMillis(100), true, 1, 60_000, 60);
+        RateLimiter limiter = new RateLimiter(catalog, store, failOpen);
+
+        installSingleFilter(limiter);
+        for (int i = 0; i < 50; i++) {
+            Resp r = call("/order/1", "app-1", "1.1.1." + (i + 1));
+            assertThat(r.status()).isEqualTo(200);
+            assertThat(r.retryAfter()).isNull(); // 故障放行不是限流拒绝，不带 Retry-After
+        }
+        assertThat(upstreamHits.get()).isEqualTo(50);
+    }
+
     /** 故障策略随用例而变：用新的 limiter 重建一次过滤器链。 */
     private void installSingleFilter(RateLimiter limiter) {
         server.disposeNow();
