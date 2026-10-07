@@ -101,7 +101,7 @@ public class RouteStore {
         Integer expectVersion = route.getVersion();
         if (expectVersion == null) {
             // 不允许「不带版本就改」，否则等于把乐观锁绕过去，静默覆盖别人的修改
-            throw new BizException("修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测");
+            return Mono.error(new BizException("修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测"));
         }
         return withLock(route.getRouteNo(), () ->
                 findByRouteNo(route.getRouteNo())
