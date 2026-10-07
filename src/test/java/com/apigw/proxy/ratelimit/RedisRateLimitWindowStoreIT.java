@@ -123,6 +123,14 @@ class RedisRateLimitWindowStoreIT {
         int limit = 200;
         int threads = 16;
         int perThread = 40; // 合计 640 抢 200
+        // 本用例的不变量「放行恰等于额度」只在同一个窗口内成立（固定窗口每窗各放一份额度）。
+        // 用独立的 60s 长窗存储，并避开窗口边界再齐射，防止突发流量跨窗把两窗的额度算进一次断言
+        RedisRateLimitWindowStore longWindowStore = new RedisRateLimitWindowStore(redis, 60);
+        long now = System.currentTimeMillis();
+        long intoWindow = now % 60_000L;
+        if (intoWindow > 55_000L) {
+            Thread.sleep(60_000L - intoWindow + 1_000L);
+        }
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(threads);
@@ -135,7 +143,9 @@ class RedisRateLimitWindowStoreIT {
                 try {
                     start.await();
                     for (int i = 0; i < perThread; i++) {
-                        RateLimitVerdict v = check(ip, limit, null);
+                        RateLimitVerdict v = longWindowStore
+                                .checkAndConsume(app, ip, limit, null)
+                                .block(Duration.ofSeconds(3));
                         if (v.allowed()) {
                             allowed.incrementAndGet();
                         } else {

@@ -15,9 +15,11 @@ import java.time.Duration;
  * @param redisTimeout         单次计数读写（整段判定 Lua）的等待上限。超时即视为计数不可用，
  *                             <b>绝不死等</b>：到点立刻按 {@link #failOpenOnError} 决策，
  *                             避免 Redis 抖动把每个请求都拖在网关上。
- * @param failOpenOnError      计数存储暂时不可用（超时/连不上/执行出错）时的总策略：
- *                             true（默认）= 这一小会儿放行（fail-open），优先保网关不被拖垮、
- *                             上游可能短暂承压但有熔断快速摘流；false = fail-closed 全挡回 503。
+ * @param failOpenOnError      计数存储暂时不可用（超时/连不上/执行出错/熔断打开/半开非探活）时的总策略：
+ *                             true（默认）= 这一小会儿放行（fail-open）且<b>不补计数</b>——存储不可用
+ *                             无处可计，也刻意不做本机兜底（本机各算一份 = 额度按实例数放大）；
+ *                             优先保网关不被拖垮、上游可能短暂承压但有熔断快速摘流；
+ *                             false = fail-closed 全挡回 503。
  * @param circuitBreakerThreshold 连续多少次计数失败后熔断打开：熔断期间根本不再发 Redis 请求，
  *                             直接按 {@link #failOpenOnError} 决策（连那几十毫秒都不等），
  *                             把依赖故障与转发线程彻底隔离。

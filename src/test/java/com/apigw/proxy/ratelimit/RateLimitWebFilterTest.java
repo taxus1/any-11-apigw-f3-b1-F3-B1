@@ -208,6 +208,34 @@ class RateLimitWebFilterTest {
         assertThat(upstreamHits.get()).isZero();
     }
 
+    @Test
+    void storeUnavailable_failOpen_passes_andQuotaUntouchedAfterRecovery() {
+        loadQuota(RateQuota.reconstitute(RateLimitScope.APP, "app-1", null, 3, null, null, null));
+        store.fail = true;
+        // 阈值调高不熔断，让每笔都走「调用失败 → fail-open」；fail-open 是放行且不计数，
+        // 没有任何本机小账本——否则多台网关各算一份，全局额度就被实例数放大
+        RateLimitProperties failOpenNoCircuit = new RateLimitProperties(true, Duration.ofSeconds(10), 10_000,
+                Duration.ofMillis(100), true, 1_000, 60_000, 60);
+        installSingleFilter(new RateLimiter(catalog, store, failOpenNoCircuit));
+
+        // 计数存储挂了：fail-open 放行，上游照收（不少放、也不暗地按本机另算）
+        for (int i = 0; i < 5; i++) {
+            assertThat(call("/order/1", "app-1", "1.1.1.1").status()).isEqualTo(200);
+        }
+        assertThat(upstreamHits.get()).isEqualTo(5);
+
+        // 存储恢复：故障期放行的 5 笔没消耗任何名额，当前窗仍精确放 3 笔、第 4 笔 429
+        store.fail = false;
+        assertThat(call("/order/1", "app-1", "1.1.1.1").status()).isEqualTo(200);
+        assertThat(call("/order/1", "app-1", "1.1.1.1").status()).isEqualTo(200);
+        assertThat(call("/order/1", "app-1", "1.1.1.1").status()).isEqualTo(200);
+        Resp fourth = call("/order/1", "app-1", "1.1.1.1");
+        assertThat(fourth.status()).isEqualTo(429);
+        assertThat(fourth.errorHeader()).isEqualTo("RATE_LIMITED_APP");
+        assertThat(Integer.parseInt(fourth.retryAfter())).isBetween(1, 60);
+        assertThat(upstreamHits.get()).isEqualTo(8);
+    }
+
     /** 故障策略随用例而变：用新的 limiter 重建一次过滤器链。 */
     private void installSingleFilter(RateLimiter limiter) {
         server.disposeNow();
